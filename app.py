@@ -17,91 +17,111 @@ def get_headers():
     ua = UserAgent()
     return {'User-Agent': ua.random}
 
-def parse_business_data(soup):
-    """Parses the HTML soup to extract business data."""
+def parse_google_maps_html(soup):
+    """
+    Parses the HTML soup of a Google Maps search results page.
+    This version is updated to handle recent changes in Google's HTML structure.
+    """
     results = []
+    # Find the main container for search results using a more stable attribute
+    main_container = soup.find('div', {'role': 'feed'})
     
-    # Find all result containers. Google's class names are obfuscated and change.
-    # We target a div that consistently appears as a container for each search result.
-    # The 'jslog' attribute seems to be a stable identifier for result items.
-    for result in soup.find_all('div', {'jslog': re.compile(r'.*')}):
+    if not main_container:
+        # Check for a "Before you continue" page which indicates a block or CAPTCHA
+        if "Before you continue" in soup.title.string:
+            st.error("Google is blocking the request (CAPTCHA). Try again later or from a different network.")
+        else:
+            st.warning("Could not find the main results container on the page. The page structure may have changed.")
+        return []
+
+    # Find all individual result items. We look for links to places.
+    place_links = main_container.find_all('a', href=re.compile(r'/maps/place/'))
+    
+    processed_links = set()
+
+    for link in place_links:
+        href = link.get('href')
+        if href in processed_links:
+            continue
+        processed_links.add(href)
         
-        # Initialize dictionary with default values
+        # The parent div of the link usually contains all info for one result
+        result_container = link.find_parent('div').find_parent('div')
+        if not result_container:
+            continue
+            
         data = {
+            'Query': 'Not Available',
             'Business Name': 'Not Available',
             'Business Category': 'Not Available',
             'Address': 'Not Available',
             'Website': 'No Website',
             'Phone Number': 'Not Available',
             'Rating': 'Not Available',
-            'Number of Reviews': 'Not Available',
-            'Business Email': 'Not Available' # Email is almost never public on the search page
+            'Number of Reviews': 'Not Available'
         }
 
         # --- Extract Business Name ---
-        name_tag = result.find('a', {'aria-label': True})
-        if name_tag:
-            data['Business Name'] = name_tag['aria-label']
-        else:
-            # Skip divs that are not actual business listings
-            continue 
+        try:
+            data['Business Name'] = link.get('aria-label', 'Not Available').strip()
+        except AttributeError:
+            continue # Skip if no name is found
 
-        # --- Extract Other Information from the result block ---
-        # The info is usually in a sibling or child div. We'll get all text and parse.
-        info_block = result.find_all('div')
+        # --- Extract other details from the text within the container ---
+        container_text_parts = result_container.get_text(separator=' · ', strip=True).split(' · ')
         
-        # Combine all text from divs within the result for easier searching
-        # This is a robust way to handle variations in Google's HTML structure
-        full_text_content = " ".join([div.text for div in info_block])
-
         # --- Extract Rating and Number of Reviews ---
-        rating_match = re.search(r'(\d\.\d)\s?★', full_text_content)
-        if rating_match:
-            data['Rating'] = rating_match.group(1)
-        
-        reviews_match = re.search(r'\((\d+,?\d*)\)', full_text_content)
-        if reviews_match:
-            data['Number of Reviews'] = reviews_match.group(1).replace(',', '')
-
-        # --- Extract Category, Address, etc. using regex on combined text ---
-        # This part is tricky because the order is not guaranteed.
-        # We look for common patterns.
-        
-        # Phone Number (matches various formats)
-        phone_match = re.search(r'(\+?\d{1,3}[-\.\s]?)?\(?\d{3}\)?[-\.\s]?\d{3}[-\.\s]?\d{4}', full_text_content)
-        if phone_match:
-            data['Phone Number'] = phone_match.group(0)
-
-        # Category and Address are often together
-        # We find the rating span and look at its neighbors, but regex on the block is more stable.
-        lines = [line.strip() for line in full_text_content.split('·') if line.strip()]
-        if len(lines) > 1:
-            # Often, the category is the first item after the review count
-            # Heuristic: The category is usually a short phrase without numbers.
-            potential_category = lines[0]
-            if not any(char.isdigit() for char in potential_category) and len(potential_category) < 50:
-                 data['Business Category'] = potential_category.replace(data['Rating'], '').replace(data['Number of Reviews'], '').strip('() ')
-            
-            # Heuristic: Address is usually one of the longer strings containing numbers.
-            for line in lines:
-                if any(char.isdigit() for char in line) and len(line) > 10 and not phone_match:
-                    data['Address'] = line
+        for part in container_text_parts:
+            if '★' in part:
+                try:
+                    rating_reviews = part.split('★')
+                    data['Rating'] = rating_reviews[0].strip()
+                    review_match = re.search(r'\((\d{1,3}(?:,\d{3})*)\)', rating_reviews[1])
+                    if review_match:
+                        data['Number of Reviews'] = review_match.group(1).replace(',', '')
                     break
+                except (IndexError, ValueError):
+                    pass
+        
+        # --- Extract Phone Number ---
+        for part in container_text_parts:
+            # A common pattern for US phone numbers
+            phone_match = re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', part)
+            if phone_match:
+                data['Phone Number'] = phone_match.group(0)
+                break
+        
+        # --- Extract Category and Address ---
+        # This is heuristic, based on common patterns.
+        # Address usually contains numbers (street number, zip code) and is longer.
+        # Category is often one of the first few text parts and doesn't contain a rating star.
+        address_parts = []
+        for part in container_text_parts:
+            if '★' in part or data['Phone Number'] in part or data['Business Name'] in part:
+                continue
+            
+            # Simple check for an address-like string
+            if any(char.isdigit() for char in part) and len(part) > 8:
+                 address_parts.append(part)
+            # A simple heuristic for category
+            elif not any(char.isdigit() for char in part) and len(part) > 2 and len(part) < 30 and data['Business Category'] == 'Not Available':
+                data['Business Category'] = part
 
+        if address_parts:
+            data['Address'] = " ".join(address_parts)
+            
         # --- Extract Website ---
-        # Website is usually in a link with a specific 'data-value'
-        website_tag = result.find('a', {'data-value': 'Website'})
+        # Website link is often found in a link with a 'data-value="Website"' attribute
+        website_tag = result_container.find('a', {'data-value': 'Website'})
         if website_tag and website_tag.get('href'):
             data['Website'] = website_tag['href']
-        
-        # Avoid duplicate entries if the same div is processed multiple times
-        if data not in results:
-            results.append(data)
+
+        results.append(data)
 
     return results
 
 def scrape_google_maps(queries):
-    """Main function to orchestrate the scraping process."""
+    """Main function to orchestrate the scraping process for multiple queries."""
     all_results = []
     total_queries = len(queries)
     
@@ -109,117 +129,105 @@ def scrape_google_maps(queries):
     status_text = st.empty()
 
     for i, query in enumerate(queries):
-        status_text.info(f"⚙️ Scraping query {i+1}/{total_queries}: '{query}'...")
-        
-        url = f"https://www.google.com/maps/search/{quote_plus(query)}"
+        query_cleaned = query.strip()
+        if not query_cleaned:
+            continue
+
+        status_text.info(f"⚙️ Scraping query {i+1}/{total_queries}: '{query_cleaned}'...")
+        url = f"https://www.google.com/maps/search/{quote_plus(query_cleaned)}"
         
         try:
-            response = requests.get(url, headers=get_headers(), timeout=15)
-            response.raise_for_status()  # Raise an exception for bad status codes
+            response = requests.get(url, headers=get_headers(), timeout=20)
+            response.raise_for_status()
             
             soup = BeautifulSoup(response.text, 'lxml')
-            
-            # The actual useful data is often embedded in a script tag as a giant string.
-            # We need to find the right script tag and parse its content.
-            scripts = soup.find_all('script')
-            data_script = None
-            for script in scripts:
-                if script.string and 'window.APP_INITIALIZATION_STATE' in script.string:
-                    data_script = script.string
-                    break
-            
-            if not data_script:
-                # Fallback to parsing the visible HTML if the main data script isn't found
-                st.warning(f"Could not find detailed data for '{query}'. Parsing basic HTML. Results may be limited.")
-                scraped_data = parse_business_data(soup)
-            else:
-                 # This is the complex part. The data is in a JS object.
-                 # We use regex to extract the main data list.
-                 # This regex is designed to find the list of search results.
-                match = re.search(r'window\.APP_INITIALIZATION_STATE=\s*(\[.+?\]);', data_script)
-                if match:
-                    # This part is highly experimental and brittle due to Google's structure
-                    # For this lightweight app, we will rely on the direct HTML parsing which is more stable
-                    # A more advanced version would need to parse the complex JS object.
-                    # For now, we stick with the `parse_business_data` on the whole soup.
-                    scraped_data = parse_business_data(soup)
-                else:
-                    scraped_data = parse_business_data(soup)
+            scraped_data = parse_google_maps_html(soup)
 
             if not scraped_data:
-                status_text.warning(f"⚠️ No results found for '{query}'. It might be a protected query or have no listings.")
+                status_text.warning(f"⚠️ No results found for '{query_cleaned}'. The query might be too specific or the page was blocked.")
             else:
                 for item in scraped_data:
-                    item['Query'] = query # Add the original query to each result
+                    item['Query'] = query_cleaned # Add the original query to each result
                 all_results.extend(scraped_data)
 
         except requests.exceptions.RequestException as e:
-            status_text.error(f"❌ Failed to fetch data for '{query}'. Error: {e}")
+            status_text.error(f"❌ Network error for '{query_cleaned}': {e}")
+        except Exception as e:
+            status_text.error(f"❌ An unexpected error occurred for '{query_cleaned}': {e}")
         
-        # Update progress and sleep to be respectful to the server
         progress_bar.progress((i + 1) / total_queries)
-        time.sleep(random.uniform(2.5, 5.5))
+        # Use a longer, more random sleep time to be safer
+        time.sleep(random.uniform(3, 6))
 
-    status_text.success("✅ Scraping complete!")
+    if not all_results:
+        status_text.error("Scraping finished, but no data was collected. This could be due to network issues, Google blocking requests, or no results for any of your queries.")
+    else:
+        status_text.success("✅ Scraping complete!")
+        
     return all_results
 
 # --- Streamlit App UI ---
 
-st.set_page_config(page_title="Lightweight Google Maps Scraper", layout="wide")
+st.set_page_config(page_title="Google Maps Scraper", layout="wide", initial_sidebar_state="expanded")
 
-st.title("🛰️ Lightweight Google Maps Scraper")
+st.title("🛰️ Unlimited Google Maps Scraper")
 st.markdown("""
-This app performs a **browserless** search on Google Maps for your queries. 
-It's lightweight and designed for Streamlit Cloud.
+This app performs a **browserless** search on Google Maps for your queries. It's lightweight, built for Streamlit Cloud, and does not use Selenium.
 
-**Instructions:**
-1.  Enter one search query per line (e.g., `Coffee shops in Dubai`).
-2.  Click "Start Scraping".
-3.  Results will appear below, and you can download them as a CSV file.
+**How to Use:**
+1.  Enter your search queries in the text box below (one per line).
+2.  Click the "Start Scraping" button.
+3.  Results will appear in a table, ready for download.
 
-⚠️ **Disclaimer:** This is for educational purposes. Scraping can be against Google's ToS. 
-The structure of Google's HTML can change, which may break the scraper.
+*Example queries: `golf clubs in new york`, `cafes in paris`, `hardware stores near me`*
+
+---
 """)
 
 # --- User Input & Controls ---
 with st.form("search_form"):
     queries_input = st.text_area(
-        "Enter Search Queries (one per line)", 
+        "Enter Search Queries (one per line)",
         height=150,
         placeholder="Coffee shops in Dubai\nGyms in New York\nBookstores in London"
     )
-    submitted = st.form_submit_button("🚀 Start Scraping")
+    submitted = st.form_submit_button("🚀 Start Scraping", use_container_width=True)
 
-# --- Main App Logic ---
+# --- Main App Logic & Results Display ---
 if submitted:
     queries = [q.strip() for q in queries_input.split('\n') if q.strip()]
     
     if not queries:
         st.warning("Please enter at least one search query.")
     else:
-        with st.spinner("Initializing scraper... This may take a moment."):
+        with st.spinner("Initializing scraper... Please wait. This can take a few minutes depending on the number of queries."):
             results = scrape_google_maps(queries)
         
         if results:
-            st.success(f"Found {len(results)} results.")
+            st.success(f"Successfully scraped {len(results)} results.")
             
-            # Convert results to DataFrame
             df = pd.DataFrame(results)
             
-            # Reorder columns for better readability
-            cols_order = ['Query', 'Business Name', 'Business Category', 'Address', 'Website', 'Phone Number', 'Rating', 'Number of Reviews', 'Business Email']
-            df = df[cols_order]
+            # Reorder columns for a clean presentation
+            cols_order = ['Query', 'Business Name', 'Business Category', 'Rating', 'Number of Reviews', 'Address', 'Phone Number', 'Website']
+            # Filter df to only include columns that exist, in the desired order
+            df = df[[col for col in cols_order if col in df.columns]]
 
-            # Display results in an interactive table
-            st.dataframe(df)
+            st.dataframe(df, use_container_width=True)
 
-            # Provide a download button for the CSV
             csv = df.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="📥 Download Results as CSV",
                 data=csv,
                 file_name="google_maps_results.csv",
                 mime="text/csv",
+                use_container_width=True
             )
         else:
-            st.error("No data could be scraped. Please check your queries or try again later.")
+            # The specific error/warning messages are now handled inside the scrape function
+            st.info("Process finished. Check messages above for details.")
+
+st.markdown("""
+---
+**⚠️ Disclaimer:** This tool is for educational and experimental purposes only. Automated scraping may be against Google's Terms of Service. The developer assumes no liability for misuse. The HTML structure of Google Maps can change at any time, which may cause this tool to stop working.
+""")
