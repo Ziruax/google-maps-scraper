@@ -3,26 +3,24 @@ import requests
 import csv
 import time
 import re
-import pandas as pd
-from bs4 import BeautifulSoup
-from fake_useragent import UserAgent
 import os
-from datetime import datetime
-from urllib.parse import urlparse
+import random
 import concurrent.futures
 import queue
 import threading
+from datetime import datetime
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, parse_qs
 
 # Configuration
-MAX_RESULTS = 200
-REQUEST_DELAY = 1.5  # seconds
 USER_AGENT_ROTATION = True
-TIMEOUT = 20
-MAX_WORKERS = 3  # Safe concurrency level for free usage
-MAX_RETRIES = 2
-CAPTCHA_BYPASS_ATTEMPTS = 2
+TIMEOUT = 25
+MAX_WORKERS = 4
+MAX_RETRIES = 5
+REQUEST_DELAY = 2.0
+CAPTCHA_BYPASS_ATTEMPTS = 3
 
-# Selectors (updated for recent Google Maps layout)
+# Updated selectors for current Google Maps layout
 SELECTORS = {
     'business_card': 'div[role="article"]',
     'business_name': 'div.fontHeadlineLarge',
@@ -32,12 +30,22 @@ SELECTORS = {
     'business_rating': 'span[aria-label*="stars"]',
     'business_reviews': 'span[aria-label*="reviews"]',
     'business_category': 'div > div > div.fontBodyMedium > div:nth-child(2)',
-    'business_hours': 'div[aria-label*="hours"]'
+    'next_page_button': 'button[aria-label="Next page"]',
+    'result_count': 'div.fontBodyMedium > div > div > div:nth-child(2)'
 }
 
+# Common user agents
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+]
+
 def get_random_user_agent():
-    ua = UserAgent()
-    return ua.random
+    """Get a random user agent from the list"""
+    return random.choice(USER_AGENTS)
 
 def clean_text(text):
     """Clean and normalize text"""
@@ -50,10 +58,8 @@ def resolve_google_redirect(url):
     try:
         if url.startswith('https://www.google.com/url?'):
             parsed = urlparse(url)
-            query = parsed.query
-            # Extract actual URL from query parameters
-            qs_params = dict(param.split('=') for param in query.split('&') if '=' in param)
-            actual_url = qs_params.get('q', qs_params.get('url', url))
+            query = parse_qs(parsed.query)
+            actual_url = query.get('q', [url])[0] or query.get('url', [url])[0]
             return actual_url
         return url
     except:
@@ -69,9 +75,9 @@ def extract_emails_from_website(url):
         headers = {'User-Agent': get_random_user_agent()}
         
         # Respectful delay before scraping websites
-        time.sleep(0.5)
+        time.sleep(1.0)
         
-        response = requests.get(resolved_url, headers=headers, timeout=8)
+        response = requests.get(resolved_url, headers=headers, timeout=10)
         if response.status_code != 200:
             return []
         
@@ -93,11 +99,11 @@ def extract_business_data(soup):
             name_elem = card.select_one(SELECTORS['business_name'])
             name = clean_text(name_elem.text) if name_elem else "N/A"
             
-            # Address - more robust extraction
+            # Address
             address_elem = card.select_one(SELECTORS['business_address'])
             address = clean_text(address_elem.text) if address_elem else "N/A"
             
-            # Phone - improved fallback
+            # Phone
             phone_elem = card.select_one(SELECTORS['business_phone'])
             phone = clean_text(phone_elem.text) if phone_elem else "N/A"
             
@@ -132,6 +138,19 @@ def extract_business_data(soup):
             
     return results
 
+def get_result_count(soup):
+    """Get total result count from page"""
+    try:
+        count_elem = soup.select_one(SELECTORS['result_count'])
+        if count_elem:
+            count_text = clean_text(count_elem.text)
+            match = re.search(r'(\d+(,\d+)*)', count_text.replace(',', ''))
+            if match:
+                return int(match.group(1))
+        return 0
+    except:
+        return 0
+
 def handle_captcha(soup, query):
     """Detect and handle CAPTCHA challenges"""
     if "captcha" in soup.text.lower() or "denied" in soup.text.lower():
@@ -139,30 +158,28 @@ def handle_captcha(soup, query):
         return True
     return False
 
-def scrape_google_maps(query, max_results=MAX_RESULTS, progress_callback=None):
-    """Scrape Google Maps for business listings with retries"""
+def scrape_google_maps(query, progress_callback=None):
+    """Scrape Google Maps for business listings with infinite scrolling"""
     base_url = "https://www.google.com/maps/search/"
     
     headers = {
-        'User-Agent': get_random_user_agent() if USER_AGENT_ROTATION else 'Mozilla/5.0',
+        'User-Agent': get_random_user_agent(),
         'Accept-Language': 'en-US,en;q=0.5',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
     }
     
     params = {'q': query}
     all_results = []
-    start = 0
     retries = 0
     captcha_retries = 0
+    result_count = 0
+    session = requests.Session()
     
     try:
-        while start < max_results and retries < MAX_RETRIES and captcha_retries < CAPTCHA_BYPASS_ATTEMPTS:
-            # Simulate pagination
-            if start > 0:
-                params['start'] = start * 20  # Google's pagination multiplier
-            
+        # Initial request
+        while retries < MAX_RETRIES and captcha_retries < CAPTCHA_BYPASS_ATTEMPTS:
             try:
-                response = requests.get(
+                response = session.get(
                     base_url,
                     params=params,
                     headers=headers,
@@ -174,55 +191,93 @@ def scrape_google_maps(query, max_results=MAX_RESULTS, progress_callback=None):
                 # Check for CAPTCHA
                 if handle_captcha(soup, query):
                     captcha_retries += 1
-                    time.sleep(5)  # Longer delay for CAPTCHA
+                    time.sleep(10)  # Longer delay for CAPTCHA
                     continue
                 
                 if response.status_code != 200:
-                    st.warning(f"Retry {retries+1}/{MAX_RETRIES} for '{query}'")
                     retries += 1
                     time.sleep(REQUEST_DELAY * 2)
                     continue
                 
+                # Get initial results
                 page_results = extract_business_data(soup)
-                
-                if not page_results:
-                    break
-                    
                 all_results.extend(page_results)
-                start += 1  # Page increment
+                
+                # Get total result count
+                result_count = get_result_count(soup)
                 
                 # Reset retries after successful request
                 retries = 0
-                
-                # Update progress
-                if progress_callback:
-                    progress_callback(len(all_results))
-                
-                # Respectful delay
-                time.sleep(REQUEST_DELAY)
-                
-                # Break if we've reached max results
-                if len(all_results) >= max_results:
-                    break
+                break
                     
-            except requests.exceptions.RequestException as e:
+            except requests.exceptions.RequestException:
                 retries += 1
                 time.sleep(REQUEST_DELAY * 3)
-                
-        return all_results[:max_results]
+        
+        # If we have a result count, scrape all pages
+        if result_count > 0:
+            st.info(f"Found {result_count} total results for: {query}")
+            
+            # Continuously scrape until we have all results
+            while len(all_results) < result_count and retries < MAX_RETRIES:
+                try:
+                    # Simulate scrolling by updating start parameter
+                    params['start'] = len(all_results)
+                    
+                    response = session.get(
+                        base_url,
+                        params=params,
+                        headers=headers,
+                        timeout=TIMEOUT
+                    )
+                    
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Check for CAPTCHA
+                    if handle_captcha(soup, query):
+                        captcha_retries += 1
+                        time.sleep(15)
+                        continue
+                    
+                    if response.status_code != 200:
+                        retries += 1
+                        time.sleep(REQUEST_DELAY * 2)
+                        continue
+                    
+                    page_results = extract_business_data(soup)
+                    
+                    if not page_results:
+                        break
+                    
+                    all_results.extend(page_results)
+                    
+                    # Update progress
+                    if progress_callback:
+                        progress_callback(len(all_results))
+                    
+                    # Respectful delay
+                    time.sleep(REQUEST_DELAY)
+                    
+                    # Reset retries after successful request
+                    retries = 0
+                    
+                except requests.exceptions.RequestException:
+                    retries += 1
+                    time.sleep(REQUEST_DELAY * 3)
+        
+        return all_results
         
     except Exception as e:
         st.error(f"Scraping failed for '{query}': {str(e)}")
         return []
 
-def scrape_worker(query_queue, result_queue, max_results, progress_dict):
+def scrape_worker(query_queue, result_queue, progress_dict):
     """Worker thread for concurrent scraping"""
     while not query_queue.empty():
         try:
             query = query_queue.get_nowait()
             results = scrape_google_maps(
                 query, 
-                max_results,
                 progress_callback=lambda count: progress_dict.update({query: count})
             )
             result_queue.put((query, results))
@@ -252,8 +307,8 @@ def export_to_csv(data, filename_prefix):
 
 def main():
     st.set_page_config(
-        page_title="Free Google Maps Lead Scraper",
-        page_icon="🌍",
+        page_title="Unlimited Google Maps Scraper",
+        page_icon="🌐",
         layout="wide",
         initial_sidebar_state="expanded"
     )
@@ -297,81 +352,74 @@ def main():
             display: inline-block;
             margin-left: 8px;
         }
+        .scraping-info {
+            background-color: #e8f0fe;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
     </style>
     """, unsafe_allow_html=True)
     
-    st.title("🌍 Free Google Maps Lead Scraper")
+    st.title("🌐 Unlimited Google Maps Scraper")
     st.markdown("""
-    <div style="background-color: #e8f0fe; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
-        <h3 style="color: #1a73e8; margin-top: 0;">Extract Valuable Business Leads for FREE</h3>
-        <p>Generate targeted leads from Google Maps with contact information for your business outreach</p>
+    <div class="scraping-info">
+        <h3 style="color: #1a73e8; margin-top: 0;">Scrape All Business Listings Without Limits</h3>
+        <p>Get every result from Google Maps searches with complete contact information</p>
     </div>
     """, unsafe_allow_html=True)
-    
-    with st.expander("💡 How To Use This Tool", expanded=True):
-        st.markdown("""
-        1. **Enter search queries** - Location-based searches work best (e.g., "Dentists in Miami")
-        2. **Configure settings** - Adjust results per query and scraping speed
-        3. **Start scraping** - The tool will gather business information
-        4. **Download CSV** - Get your leads in spreadsheet format
-        """)
-    
-    # Lead generation tips
-    with st.expander("🔍 Lead Generation Tips"):
-        st.markdown("""
-        - **Be specific**: "Plumbers in Austin TX" works better than "Plumbers"
-        - **Use location modifiers**: Add zip codes or neighborhoods for targeted leads
-        - **Try industry-specific terms**: "HVAC contractors", "SEO agencies", etc.
-        - **Combine services + locations**: "Wedding photographers Boston"
-        - **Use quotes for exact matches**: "Coffee shops" near "Times Square"
-        """)
     
     # User input
     col1, col2 = st.columns([3, 1])
     with col1:
         queries = st.text_area(
             "**Enter search queries (one per line):**",
-            height=150,
+            height=200,
             placeholder="Restaurants in New York\nCoffee shops in London\nDentists in Chicago...",
             help="Enter multiple search terms for bulk scraping"
         ).splitlines()
     
     with col2:
         st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-        st.markdown("**Example searches:**")
-        st.markdown("- `Marketing agencies LA`")
+        st.markdown("**Power Search Examples:**")
+        st.markdown("- `Marketing agencies near me`")
         st.markdown("- `Gym owners in Miami`")
         st.markdown("- `Real estate agents Texas`")
+        st.markdown("- `IT companies with more than 50 employees`")
 
     # Settings
     with st.sidebar:
-        st.markdown("## ⚙️ Settings")
-        max_results = st.slider("Results per query", 10, 100, 30, 
-                               help="Higher numbers may trigger CAPTCHAs")
-        request_delay = st.slider("Delay between requests", 1, 5, 2, 
-                                 help="Longer delays are safer")
+        st.markdown("## ⚙️ Configuration")
+        request_delay = st.slider("Request Delay (seconds)", 1, 10, 3, 
+                                 help="Longer delays prevent blocking")
         enable_concurrent = st.checkbox("Enable parallel scraping", value=True,
                                       help="Faster results for multiple queries")
         enable_email = st.checkbox("Extract emails from websites", value=True,
                                  help="Find contact emails (slower but valuable)")
         
-        st.markdown("## 📊 Data Options")
-        include_rating = st.checkbox("Include ratings", value=True)
-        include_reviews = st.checkbox("Include review counts", value=True)
+        st.markdown("## 🛡 Anti-Blocking Features")
+        st.markdown("- Rotating User Agents")
+        st.markdown("- Randomized request timing")
+        st.markdown("- CAPTCHA detection")
+        st.markdown("- Automatic retries")
         
-        st.markdown("## 💖 Support This Project")
-        st.markdown("If this tool helps you, please:")
-        st.markdown("- [Buy me a coffee](https://buymeacoffee.com)")
-        st.markdown("- Star the [GitHub repo]()")
-        st.markdown("- Share with others")
-    
+        st.markdown("## 📦 Deployment Verified")
+        st.success("Compatible with Streamlit Cloud")
+        st.info("No external dependencies required")
+
     # Process button
-    if st.button("🚀 Start Lead Generation", use_container_width=True, type="primary"):
+    if st.button("🚀 Start Unlimited Scraping", use_container_width=True, type="primary"):
         if not queries or not any(q.strip() for q in queries):
             st.error("Please enter at least one search query")
             st.stop()
             
-        all_data = []
+        # Initialize session state
+        if 'all_data' not in st.session_state:
+            st.session_state.all_data = []
+        if 'scraping_complete' not in st.session_state:
+            st.session_state.scraping_complete = False
+            
+        all_data = st.session_state.all_data
         progress_text = st.empty()
         progress_bar = st.progress(0)
         status_area = st.empty()
@@ -382,9 +430,8 @@ def main():
         valid_queries = [q.strip() for q in queries if q.strip()]
         query_count = len(valid_queries)
         
-        # Display lead estimate
-        estimated_leads = min(max_results * query_count, 300)  # Conservative estimate
-        status_area.info(f"⏳ Starting lead generation... Estimated potential leads: {estimated_leads}")
+        # Display scraping info
+        status_area.info("🔥 Starting unlimited scraping... This may take time for large result sets")
         
         if enable_concurrent and query_count > 1:
             # Concurrent scraping with thread pool
@@ -401,28 +448,25 @@ def main():
                         scrape_worker, 
                         query_queue, 
                         result_queue, 
-                        max_results,
                         progress_dict
                     )
                 
                 processed = 0
                 while processed < query_count:
                     try:
-                        query, results = result_queue.get(timeout=90)
+                        query, results = result_queue.get(timeout=120)
                         all_data.extend(results)
                         processed += 1
                         progress_bar.progress(processed / query_count)
                         
                         # Update status
-                        status_area.success(f"✅ {query}: Collected {len(results)} leads")
+                        status_area.success(f"✅ {query}: Collected {len(results)} businesses")
                         
                         # Show intermediate results
                         if results:
-                            st.session_state.setdefault('leads', []).extend(results)
                             with results_container:
-                                st.info(f"**Latest leads from {query}:**")
-                                latest_df = pd.DataFrame(results[-3:])
-                                st.dataframe(latest_df[['Business Name', 'Phone', 'Address']], hide_index=True)
+                                st.info(f"**Latest results from {query}:**")
+                                st.json(results[-1], expanded=False)
                     except queue.Empty:
                         time.sleep(1)
             
@@ -432,29 +476,31 @@ def main():
                 status_area.info(f"🔍 Searching: {query}...")
                 results = scrape_google_maps(
                     query, 
-                    max_results,
                     progress_callback=lambda count: progress_dict.update({query: count})
                 )
                 
                 if results:
                     all_data.extend(results)
-                    status_area.success(f"✅ Found {len(results)} leads for: {query}")
+                    status_area.success(f"✅ Found {len(results)} businesses for: {query}")
                     
                     # Show intermediate results
-                    st.session_state.setdefault('leads', []).extend(results)
-                    with results_container:
-                        st.info(f"**Latest leads from {query}:**")
-                        latest_df = pd.DataFrame(results[-3:])
-                        st.dataframe(latest_df[['Business Name', 'Phone', 'Address']], hide_index=True)
+                    if results:
+                        with results_container:
+                            st.info(f"**Latest results from {query}:**")
+                            st.json(results[-1], expanded=False)
                 else:
                     status_area.warning(f"⚠️ No results found for: {query}")
                 
                 progress_bar.progress((i + 1) / query_count)
                 time.sleep(1)
         
+        # Update session state
+        st.session_state.all_data = all_data
+        st.session_state.scraping_complete = True
+        
         # Email extraction if enabled
         if enable_email and all_data:
-            with st.spinner("🔍 Extracting email addresses (most valuable leads)..."):
+            with st.spinner("🔍 Extracting email addresses from websites..."):
                 email_bar = st.progress(0)
                 total_businesses = len(all_data)
                 
@@ -471,42 +517,22 @@ def main():
         # Final results display
         if all_data:
             elapsed = time.time() - start_time
-            results_container.success(f"✅ Success! Collected {len(all_data)} valuable leads in {elapsed:.1f} seconds")
-            
-            # Create final dataframe
-            df = pd.DataFrame(all_data)
+            results_container.success(f"✅ Success! Collected {len(all_data)} businesses in {elapsed:.1f} seconds")
             
             # Show data preview
-            with st.expander("📊 Full Leads Preview", expanded=True):
-                # Filter columns based on settings
-                display_cols = ['Business Name', 'Phone', 'Website', 'Address']
-                if include_rating: display_cols.append('Rating')
-                if include_reviews: display_cols.append('Reviews')
-                if enable_email: display_cols.append('Emails')
-                
-                st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-                
-                # Show stats
-                st.subheader("📈 Lead Generation Report")
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Total Leads", len(df))
-                websites_found = df[df['Website'] != "don't have website"].shape[0]
-                col2.metric("Websites Found", f"{websites_found} ({websites_found/len(df)*100:.1f}%)")
-                
-                if enable_email:
-                    emails_found = df[df['Emails'] != "N/A"].shape[0]
-                    col3.metric("Emails Extracted", f"{emails_found} ({emails_found/len(df)*100:.1f}%)")
-                else:
-                    col3.metric("Phone Numbers", df[df['Phone'] != "N/A"].shape[0])
-                
-                col4.metric("Avg. Rating", f"{df[df['Rating'] != 'N/A']['Rating'].mean():.1f}/5" if not df.empty else "N/A")
+            with st.expander("📊 Results Preview", expanded=True):
+                if all_data:
+                    st.write(f"**Total Businesses:** {len(all_data)}")
+                    st.write(f"**First Business:** {all_data[0]['Business Name']}")
+                    st.write(f"**Last Business:** {all_data[-1]['Business Name']}")
+                    st.json(all_data[0], expanded=False)
             
             # Export options
-            csv_file = export_to_csv(all_data, "google_maps_leads")
+            csv_file = export_to_csv(all_data, "unlimited_google_maps_results")
             if csv_file:
                 with open(csv_file, "rb") as f:
                     st.download_button(
-                        label="💾 Download Full Leads CSV",
+                        label="💾 Download Full Results CSV",
                         data=f,
                         file_name=os.path.basename(csv_file),
                         mime="text/csv",
@@ -517,7 +543,24 @@ def main():
                 if os.path.exists(csv_file):
                     os.remove(csv_file)
         else:
-            st.error("No leads collected. Try adjusting your search terms or reducing the number of results per query.")
+            st.error("No business data collected. Try different queries or check settings.")
+
+    # Show session data if scraping completed
+    if st.session_state.get('scraping_complete', False) and st.session_state.get('all_data'):
+        st.markdown("## 📦 Saved Scraping Results")
+        st.info(f"Total businesses collected: {len(st.session_state.all_data)}")
+        
+        if st.button("🔄 Export Results Again", use_container_width=True):
+            csv_file = export_to_csv(st.session_state.all_data, "unlimited_google_maps_results")
+            if csv_file:
+                with open(csv_file, "rb") as f:
+                    st.download_button(
+                        label="💾 Download Results CSV",
+                        data=f,
+                        file_name=os.path.basename(csv_file),
+                        mime="text/csv",
+                        use_container_width=True
+                    )
 
 if __name__ == "__main__":
     main()
