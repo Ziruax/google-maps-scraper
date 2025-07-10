@@ -19,32 +19,50 @@ logger = logging.getLogger(__name__)
 USER_AGENT_ROTATION = True
 TIMEOUT = 30
 MAX_RETRIES = 5
-REQUEST_DELAY = 3.0
+REQUEST_DELAY = 2.0
 CAPTCHA_BYPASS_ATTEMPTS = 3
 
-# Updated selectors with multiple fallbacks
+# UPDATED SELECTORS - fixed to match current Google Maps structure
 SELECTORS = {
-    'business_card': ['div[role="article"]', 'div.Nv2PK', 'div.section-result'],
-    'business_name': ['div.fontHeadlineLarge', 'div.qBF1Pd', 'h2.section-result-title'],
+    'business_card': ['div[role="article"]', 'div.Nv2PK', 'div.section-result', 'div.lI9IFe', 'div.THOPZb'],
+    'business_name': ['div.fontHeadlineLarge', 'div.qBF1Pd', 'h2.section-result-title', 'h2.drO22b'],
     'business_address': [
+        'div.W4Efsd:not(:has(span.W4Efsd))',
         'div > div > div.fontBodyMedium > div:nth-child(4)',
-        'div.W4Efsd > span:nth-child(2)',
-        'span.section-result-location'
+        'span.section-result-location',
+        'div.UaQhfb'
     ],
     'business_phone': [
-        'div > div > div.fontBodyMedium > div:nth-child(5)',
         'span[aria-label*="Phone"]',
+        'span[data-tooltip*="Phone"]',
+        'div.W4Efsd > span:nth-child(3)',
         'span.section-result-phone'
     ],
     'business_website': [
         'a[href*="/url?"]',
         'a[aria-label*="Website"]',
-        'a.section-result-action-icon'
+        'a.section-result-action-icon',
+        'a[data-tooltip*="Website"]'
     ],
-    'business_rating': ['span[aria-label*="stars"]', 'div.section-result-rating'],
-    'business_reviews': ['span[aria-label*="reviews"]', 'span.section-result-num-ratings'],
-    'business_category': ['div > div > div.fontBodyMedium > div:nth-child(2)', 'div.section-result-details-container'],
-    'result_count': ['div.fontBodyMedium > div > div > div:nth-child(2)', 'div.section-result-header']
+    'business_rating': [
+        'span[aria-label*="stars"]', 
+        'span[role="img"]', 
+        'div.section-result-rating'
+    ],
+    'business_reviews': [
+        'span[aria-label*="reviews"]', 
+        'span.julYat', 
+        'span.section-result-num-ratings'
+    ],
+    'business_category': [
+        'div.W4Efsd > span:nth-child(1)',
+        'div > div > div.fontBodyMedium > div:nth-child(2)',
+        'div.section-result-details-container'
+    ],
+    'result_count': [
+        'div.m6QErb.DxyBCb.kA9KIf.dS8AEf',
+        'div.fontBodyMedium > div > div > div:nth-child(2)'
+    ]
 }
 
 # Common user agents
@@ -104,9 +122,12 @@ def extract_emails_from_website(url):
 def find_element_with_fallback(soup, selectors):
     """Try multiple selectors until one works"""
     for selector in selectors:
-        element = soup.select_one(selector)
-        if element:
-            return element
+        try:
+            elements = soup.select(selector)
+            if elements:
+                return elements
+        except Exception as e:
+            logger.warning(f"Selector error: {selector} - {str(e)}")
     return None
 
 def extract_business_data(soup):
@@ -114,9 +135,11 @@ def extract_business_data(soup):
     results = []
     
     # Try all possible card selectors
+    business_cards = []
     for card_selector in SELECTORS['business_card']:
-        business_cards = soup.select(card_selector)
-        if business_cards:
+        cards = soup.select(card_selector)
+        if cards:
+            business_cards = cards
             break
     
     if not business_cards:
@@ -129,35 +152,65 @@ def extract_business_data(soup):
         try:
             # Business Name
             name_elem = find_element_with_fallback(card, SELECTORS['business_name'])
-            name = clean_text(name_elem.text) if name_elem else "N/A"
+            name = clean_text(name_elem[0].text) if name_elem and len(name_elem) > 0 else "N/A"
             
-            # Address
+            # Address - improved handling
             address_elem = find_element_with_fallback(card, SELECTORS['business_address'])
-            address = clean_text(address_elem.text) if address_elem else "N/A"
+            address = ""
+            if address_elem:
+                for elem in address_elem:
+                    text = clean_text(elem.text)
+                    if text and not any(word in text.lower() for word in ["hours", "open", "closed", "phone"]):
+                        address = text
+                        break
+                if not address:
+                    address = clean_text(address_elem[0].text) if address_elem else "N/A"
+            else:
+                address = "N/A"
             
             # Phone
             phone_elem = find_element_with_fallback(card, SELECTORS['business_phone'])
-            phone = clean_text(phone_elem.text) if phone_elem else "N/A"
+            phone = clean_text(phone_elem[0].text) if phone_elem and len(phone_elem) > 0 else "N/A"
             
             # Website
-            website_elem = find_element_with_fallback(card, SELECTORS['business_website'])
-            website = website_elem['href'] if website_elem else "don't have website"
+            website = "don't have website"
+            website_elems = find_element_with_fallback(card, SELECTORS['business_website'])
+            if website_elems:
+                for elem in website_elems:
+                    if 'href' in elem.attrs:
+                        website = elem['href']
+                        break
             website = resolve_google_redirect(website)
             
             # Rating
             rating_elem = find_element_with_fallback(card, SELECTORS['business_rating'])
-            if rating_elem and 'aria-label' in rating_elem.attrs:
-                rating = clean_text(rating_elem['aria-label'].split()[0])
-            else:
-                rating = clean_text(rating_elem.text) if rating_elem else "N/A"
+            rating = "N/A"
+            if rating_elem:
+                for elem in rating_elem:
+                    if 'aria-label' in elem.attrs:
+                        rating_text = elem['aria-label']
+                        match = re.search(r'(\d+\.?\d*)', rating_text)
+                        if match:
+                            rating = match.group(1)
+                            break
+                    else:
+                        match = re.search(r'(\d+\.?\d*)', elem.text)
+                        if match:
+                            rating = match.group(1)
+                            break
             
             # Reviews
             reviews_elem = find_element_with_fallback(card, SELECTORS['business_reviews'])
-            reviews = clean_text(reviews_elem.text) if reviews_elem else "N/A"
+            reviews = "N/A"
+            if reviews_elem:
+                reviews_text = clean_text(reviews_elem[0].text)
+                match = re.search(r'(\d[\d,]*)', reviews_text.replace(',', ''))
+                if match:
+                    reviews = match.group(1)
             
             # Category
             category_elem = find_element_with_fallback(card, SELECTORS['business_category'])
-            category = clean_text(category_elem.text) if category_elem else "N/A"
+            category = clean_text(category_elem[0].text) if category_elem and len(category_elem) > 0 else "N/A"
             
             results.append({
                 'Business Name': name,
@@ -177,19 +230,21 @@ def extract_business_data(soup):
 def get_result_count(soup):
     """Get total result count from page"""
     try:
-        count_elem = find_element_with_fallback(soup, SELECTORS['result_count'])
-        if count_elem:
-            count_text = clean_text(count_elem.text)
-            match = re.search(r'(\d+(,\d+)*)', count_text.replace(',', ''))
-            if match:
-                return int(match.group(1))
+        for selector in SELECTORS['result_count']:
+            count_elem = soup.select(selector)
+            if count_elem:
+                count_text = clean_text(count_elem[0].text)
+                match = re.search(r'(\d+(,\d+)*)', count_text.replace(',', ''))
+                if match:
+                    return int(match.group(1))
         return 0
     except:
         return 0
 
 def handle_captcha(response, query):
     """Detect and handle CAPTCHA challenges"""
-    if "captcha" in response.text.lower() or "denied" in response.text.lower():
+    captcha_indicators = ["captcha", "denied", "sorry", "automated", "robot"]
+    if any(indicator in response.text.lower() for indicator in captcha_indicators):
         logger.warning(f"CAPTCHA detected for: {query}")
         return True
     return False
@@ -254,54 +309,27 @@ def scrape_google_maps(query):
                 retries += 1
                 time.sleep(REQUEST_DELAY * 3)
         
-        # If we have a result count, scrape all pages
-        if result_count > 0:
-            logger.info(f"Found {result_count} total results for: {query}")
+        # Only attempt pagination if we have results
+        if page_results:
+            # Scroll to get more results (simulated by changing viewport)
+            scroll_params = {'q': query, 'start': len(all_results)}
             
-            # Continuously scrape until we have all results
-            while len(all_results) < result_count and retries < MAX_RETRIES:
-                try:
-                    # Simulate scrolling by updating start parameter
-                    params['start'] = len(all_results)
-                    
-                    response = session.get(
-                        base_url,
-                        params=params,
-                        headers=headers,
-                        timeout=TIMEOUT
-                    )
-                    
-                    if handle_captcha(response, query):
-                        captcha_retries += 1
-                        time.sleep(15)
-                        continue
-                    
-                    if response.status_code != 200:
-                        retries += 1
-                        time.sleep(REQUEST_DELAY * 2)
-                        continue
-                    
+            try:
+                response = session.get(
+                    base_url,
+                    params=scroll_params,
+                    headers=headers,
+                    timeout=TIMEOUT
+                )
+                
+                if not handle_captcha(response, query) and response.status_code == 200:
                     soup = BeautifulSoup(response.text, 'html.parser')
-                    page_results = extract_business_data(soup)
-                    
-                    if not page_results:
-                        logger.info("No more results found")
-                        break
-                    
-                    all_results.extend(page_results)
-                    
-                    logger.info(f"Page results: {len(page_results)} | Total collected: {len(all_results)}")
-                    
-                    # Respectful delay
-                    time.sleep(REQUEST_DELAY)
-                    
-                    # Reset retries after successful request
-                    retries = 0
-                    
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"Request exception: {str(e)}")
-                    retries += 1
-                    time.sleep(REQUEST_DELAY * 3)
+                    additional_results = extract_business_data(soup)
+                    if additional_results:
+                        all_results.extend(additional_results)
+                        logger.info(f"Additional results: {len(additional_results)} | Total: {len(all_results)}")
+            except Exception as e:
+                logger.warning(f"Pagination failed: {str(e)}")
         
         return all_results
         
@@ -377,6 +405,13 @@ def main():
             border-radius: 10px;
             margin-top: 20px;
         }
+        .result-card {
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+            background-color: #f8f9fa;
+        }
     </style>
     """, unsafe_allow_html=True)
     
@@ -384,7 +419,7 @@ def main():
     st.markdown("""
     <div class="scraping-info">
         <h3 style="color: #1a73e8; margin-top: 0;">Advanced Scraping with Multiple Fallback Methods</h3>
-        <p>This version uses multiple selector strategies to overcome Google's anti-scraping measures</p>
+        <p><strong>Fixed selector issues</strong> and improved data extraction reliability</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -410,17 +445,18 @@ def main():
     # Settings
     with st.sidebar:
         st.markdown("## ⚙️ Configuration")
-        request_delay = st.slider("Request Delay (seconds)", 1, 10, 3, 
+        request_delay = st.slider("Request Delay (seconds)", 1, 10, 2, 
                                  help="Longer delays prevent blocking")
         enable_email = st.checkbox("Extract emails from websites", value=True,
                                  help="Find contact emails (slower but valuable)")
+        max_results = st.slider("Max Results per Query", 10, 100, 30,
+                               help="Limit results per search query")
         
         st.markdown("## 🛡 Anti-Blocking Features")
         st.markdown("- Multiple selector fallbacks")
         st.markdown("- Rotating User Agents")
         st.markdown("- CAPTCHA detection")
         st.markdown("- Request throttling")
-        st.markdown("- Session persistence")
         
         st.markdown("## 🐞 Debugging Tools")
         debug_mode = st.checkbox("Enable debug mode", value=False,
@@ -464,10 +500,12 @@ def main():
                     status_text.info(f"Attempt {attempt+1}/{MAX_RETRIES} for: {query}")
                     results = scrape_google_maps(query)
                     if results:
+                        # Apply max results limit
+                        results = results[:max_results]
                         break
                 except Exception as e:
                     status_text.error(f"Error during attempt {attempt+1}: {str(e)}")
-                    time.sleep(REQUEST_DELAY * 2)
+                    time.sleep(request_delay * 2)
             
             if results:
                 all_data.extend(results)
@@ -476,12 +514,22 @@ def main():
                 # Show intermediate results
                 with results_container:
                     st.info(f"**Results from {query}:**")
-                    st.json(results[0] if results else {}, expanded=False)
+                    with st.expander("View Results", expanded=False):
+                        for i, biz in enumerate(results[:5]):
+                            st.markdown(f"""
+                            <div class="result-card">
+                                <h4>{i+1}. {biz['Business Name']}</h4>
+                                <p><strong>Category:</strong> {biz['Category']}</p>
+                                <p><strong>Address:</strong> {biz['Address']}</p>
+                                <p><strong>Phone:</strong> {biz['Phone']}</p>
+                                <p><strong>Website:</strong> {biz['Website']}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
             else:
                 status_area.warning(f"⚠️ No results found for: {query}")
             
             progress_bar.progress(100)
-            time.sleep(1)
+            time.sleep(request_delay)
         
         # Update session state
         st.session_state.all_data = all_data
