@@ -1,205 +1,65 @@
-# app.py
-
 import streamlit as st
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 import time
-import random
-import re
 from urllib.parse import quote_plus
 
-# --- Core Scraping and Parsing Functions ---
-
+# Headers with random User-Agent
 def get_headers():
-    """Generates random User-Agent headers. This is a key part of mimicking a real browser."""
-    ua = UserAgent()
+    ua = UserAgent(fallback="Mozilla/5.0")
     return {'User-Agent': ua.random}
 
-def parse_google_maps_html(soup):
-    """
-    Parses the HTML soup of a Google Maps search results page.
-    This version is hardened against structural changes and NoneType errors.
-    """
-    results = []
-    main_container = soup.find('div', {'role': 'feed'})
-    
-    if not main_container:
-        if "Before you continue" in soup.get_text():
-            st.error("Google is blocking the request (CAPTCHA/consent page). Please try again later.")
-        else:
-            st.warning("Could not find the main results container. The page structure may have changed, or there are no results.")
-        return []
+# Core scraper function
+def scrape_query(query):
+    url = f"https://www.google.com/maps/search/ {quote_plus(query)}"
+    headers = get_headers()
 
-    all_links = main_container.find_all('a', href=re.compile(r'https://www.google.com/maps/place/'))
-    
-    processed_hrefs = set()
-
-    for link in all_links:
-        href = link.get('href')
-        if not href or href in processed_hrefs:
-            continue
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if 'Our systems have detected unusual traffic' in response.text:
+            return [{'error': 'CAPTCHA triggered. Try again later.'}]
         
-        result_container = link.find_parent('div', {'jsaction': True})
-        if not result_container:
-            continue
-            
-        processed_hrefs.add(href)
-        
-        data = {
-            'Query': 'Not Available',
-            'Business Name': 'Not Available',
-            'Business Category': 'Not Available',
-            'Address': 'Not Available',
-            'Website': 'No Website',
-            'Phone Number': 'Not Available',
-            'Rating': 'Not Available',
-            'Number of Reviews': 'Not Available'
-        }
+        soup = BeautifulSoup(response.text, 'html.parser')
+        businesses = []
 
-        business_name = link.get('aria-label')
-        if not business_name:
-            continue
-        data['Business Name'] = business_name.strip()
+        # Extract from known containers (update class names if Google changes them)
+        results = soup.find_all('div', class_='Nv2outer')
+        for result in results:
+            businesses.append({
+                'Name': result.find('span', class_='OSrXXb')?.text.strip() or 'Not Available',
+                'Address': result.find('div', class_='EI11Pd')?.text.strip() or 'Not Available',
+                'Rating': result.find('span', class_='MW4etd')?.text.strip() or 'Not Available',
+                'Category': result.find('span', class_='DkEjCd')?.text.strip() or 'Not Available'
+            })
 
-        container_text = result_container.get_text(separator=' · ', strip=True) or ""
-        text_parts = container_text.split(' · ')
+        return businesses or [{'error': 'No results found.'}]
+    except Exception as e:
+        return [{'error': f'Request failed: {str(e)}'}]
 
-        for part in text_parts:
-            if '★' in part:
-                try:
-                    rating_match = re.search(r'(\d\.\d)\s?★', part)
-                    if rating_match: data['Rating'] = rating_match.group(1)
-                    
-                    reviews_match = re.search(r'\((\d{1,3}(?:,\d{3})*)\)', part)
-                    if reviews_match: data['Number of Reviews'] = reviews_match.group(1).replace(',', '')
-                except (IndexError, ValueError):
-                    pass
+# Streamlit UI
+def main():
+    st.set_page_config(page_title="gMaps Scraper", layout="wide")
+    st.title("gMaps Bulk Scraper (Streamlit Cloud)")
+    queries = st.text_area("Search Queries", height=200, placeholder="e.g., coffee shops in Dubai\ngyms in New York...")
+    start = st.button("Start Scraping")
 
-        phone_found = False
-        address_found = False
-        
-        for part in text_parts:
-            if part == data['Business Name'] or '★' in part or part.lower() in ['directions', 'website', 'call']:
-                continue
-            
-            if not phone_found and (re.search(r'^\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}$', part) or re.search(r'^\+\d{1,}', part)):
-                data['Phone Number'] = part
-                phone_found = True
-                continue
-            
-            if not address_found and any(char.isdigit() for char in part) and len(part) > 10:
-                data['Address'] = part
-                address_found = True
-                continue
+    if start and queries:
+        query_list = [q.strip() for q in queries.split('\n') if q.strip()]
+        progress_bar = st.progress(0)
+        status = st.empty()
+        scraped_data = []
 
-            if data['Business Category'] == 'Not Available' and not any(char.isdigit() for char in part) and 2 < len(part) < 30:
-                 data['Business Category'] = part
+        for i, query in enumerate(query_list):
+            status.text(f"Scraping: {query} ({i+1}/{len(query_list)})")
+            results = scrape_query(query)
+            scraped_data.extend(results)
+            progress_bar.progress((i+1)/len(query_list))
+            time.sleep(3)  # Avoid rate-limiting
 
-        website_tag = result_container.find('a', {'data-value': 'Website'})
-        if website_tag and website_tag.get('href'):
-            data['Website'] = website_tag['href']
+        df = pd.DataFrame(scraped_data)
+        st.dataframe(df)
+        st.download_button("Download CSV", df.to_csv(index=False), "results.csv")
 
-        results.append(data)
-
-    return results
-
-def scrape_google_maps(queries):
-    """Main function to orchestrate the scraping process for multiple queries."""
-    all_results = []
-    total_queries = len(queries)
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    for i, query in enumerate(queries):
-        query_cleaned = query.strip()
-        if not query_cleaned:
-            continue
-
-        status_text.info(f"⚙️ Scraping query {i+1}/{total_queries}: '{query_cleaned}'...")
-        url = f"https://www.google.com/maps/search/{quote_plus(query_cleaned)}"
-        
-        try:
-            # Each request gets a fresh, random User-Agent from this call
-            response = requests.get(url, headers=get_headers(), timeout=20)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'lxml')
-            scraped_data = parse_google_maps_html(soup)
-
-            if not scraped_data:
-                status_text.warning(f"⚠️ No parseable results for '{query_cleaned}'. Query might be too broad/narrow, or the page was blocked.")
-            else:
-                for item in scraped_data: item['Query'] = query_cleaned
-                all_results.extend(scraped_data)
-
-        except requests.exceptions.RequestException as e:
-            status_text.error(f"❌ Network error for '{query_cleaned}': {e}")
-        except Exception as e:
-            status_text.error(f"❌ An unexpected error occurred for '{query_cleaned}': {e}")
-        
-        progress_bar.progress((i + 1) / total_queries)
-        time.sleep(random.uniform(3, 6))
-
-    if not all_results:
-        status_text.error("Scraping finished, but no data was collected. This could be due to network issues, Google blocking all requests, or no results for your queries.")
-    else:
-        status_text.success("✅ Scraping complete!")
-        
-    return all_results
-
-# --- Streamlit App UI ---
-st.set_page_config(page_title="Google Maps Scraper", layout="wide", initial_sidebar_state="expanded")
-
-st.title("🛰️ Robust Google Maps Scraper")
-st.markdown("""
-This app performs a **browserless** search on Google Maps. It's built to be resilient against common HTML changes and uses randomized headers for each request.
-
-**Instructions:**
-1.  Enter search queries in the box below (one per line).
-2.  Click "Start Scraping" and wait for the process to complete.
-3.  Results appear in a table and can be downloaded as a CSV file.
-""")
-
-with st.form("search_form"):
-    queries_input = st.text_area(
-        "Enter Search Queries (one per line)",
-        height=150,
-        placeholder="golf clubs in new york\ncafes in paris\nhardware stores near me"
-    )
-    submitted = st.form_submit_button("🚀 Start Scraping", use_container_width=True)
-
-if submitted:
-    queries = [q.strip() for q in queries_input.split('\n') if q.strip()]
-    
-    if not queries:
-        st.warning("Please enter at least one search query.")
-    else:
-        results = scrape_google_maps(queries)
-        
-        if results:
-            st.success(f"Successfully scraped {len(results)} business listings.")
-            df = pd.DataFrame(results)
-            
-            cols_order = ['Query', 'Business Name', 'Business Category', 'Rating', 'Number of Reviews', 'Address', 'Phone Number', 'Website']
-            df = df[[col for col in cols_order if col in df.columns]]
-
-            st.dataframe(df, use_container_width=True, height=500)
-
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Results as CSV",
-                data=csv,
-                file_name="google_maps_results.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        else:
-            st.info("Process finished. Check messages above for details on why no data was returned.")
-
-st.markdown("""
----
-**⚠️ Disclaimer:** For educational purposes only. Automated scraping can be against a website's Terms of Service. The developer assumes no liability for misuse.
-""")
+main()
