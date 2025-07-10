@@ -13,7 +13,7 @@ from urllib.parse import quote_plus
 # --- Core Scraping and Parsing Functions ---
 
 def get_headers():
-    """Generates random User-Agent headers."""
+    """Generates random User-Agent headers. This is a key part of mimicking a real browser."""
     ua = UserAgent()
     return {'User-Agent': ua.random}
 
@@ -27,12 +27,11 @@ def parse_google_maps_html(soup):
     
     if not main_container:
         if "Before you continue" in soup.get_text():
-            st.error("Google is blocking the request (CAPTCHA/consent page).")
+            st.error("Google is blocking the request (CAPTCHA/consent page). Please try again later.")
         else:
             st.warning("Could not find the main results container. The page structure may have changed, or there are no results.")
         return []
 
-    # Find all potential result items
     all_links = main_container.find_all('a', href=re.compile(r'https://www.google.com/maps/place/'))
     
     processed_hrefs = set()
@@ -42,17 +41,10 @@ def parse_google_maps_html(soup):
         if not href or href in processed_hrefs:
             continue
         
-        # --- THE CRITICAL FIX IS HERE ---
-        # Find the parent container that represents a single search result "card".
-        # This is more reliable than find_parent().find_parent().
-        # We look for a div with a 'jsaction' attribute, which is common for result items.
         result_container = link.find_parent('div', {'jsaction': True})
-
-        # If we can't find a proper container, it's likely a non-result link, so we skip it.
         if not result_container:
             continue
             
-        # Add to processed to avoid duplicates from multiple links in the same card
         processed_hrefs.add(href)
         
         data = {
@@ -66,58 +58,45 @@ def parse_google_maps_html(soup):
             'Number of Reviews': 'Not Available'
         }
 
-        # --- Extract Business Name from the aria-label of the link ---
         business_name = link.get('aria-label')
         if not business_name:
-            continue # If there's no aria-label, it's not a main business link.
+            continue
         data['Business Name'] = business_name.strip()
 
-        # --- Extract other details from the text within the container ---
-        # Use a fallback to prevent error if get_text returns None (highly unlikely but safe)
         container_text = result_container.get_text(separator=' · ', strip=True) or ""
         text_parts = container_text.split(' · ')
 
-        # --- Extract Rating and Reviews ---
         for part in text_parts:
             if '★' in part:
                 try:
                     rating_match = re.search(r'(\d\.\d)\s?★', part)
-                    if rating_match:
-                        data['Rating'] = rating_match.group(1)
+                    if rating_match: data['Rating'] = rating_match.group(1)
                     
                     reviews_match = re.search(r'\((\d{1,3}(?:,\d{3})*)\)', part)
-                    if reviews_match:
-                        data['Number of Reviews'] = reviews_match.group(1).replace(',', '')
+                    if reviews_match: data['Number of Reviews'] = reviews_match.group(1).replace(',', '')
                 except (IndexError, ValueError):
-                    pass # Ignore if parsing fails
+                    pass
 
-        # --- Extract other info by iterating through the text parts ---
-        # Heuristics are needed as the order and presence of elements vary.
         phone_found = False
         address_found = False
         
         for part in text_parts:
-            # Skip parts that are clearly not category, address, or phone
             if part == data['Business Name'] or '★' in part or part.lower() in ['directions', 'website', 'call']:
                 continue
             
-            # Heuristic for Phone Number
             if not phone_found and (re.search(r'^\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}$', part) or re.search(r'^\+\d{1,}', part)):
                 data['Phone Number'] = part
                 phone_found = True
                 continue
             
-            # Heuristic for Address (often contains numbers and is longer)
             if not address_found and any(char.isdigit() for char in part) and len(part) > 10:
                 data['Address'] = part
                 address_found = True
                 continue
 
-            # Heuristic for Category (usually short, no digits, and not found yet)
             if data['Business Category'] == 'Not Available' and not any(char.isdigit() for char in part) and 2 < len(part) < 30:
                  data['Business Category'] = part
 
-        # --- Extract Website from a specific button ---
         website_tag = result_container.find('a', {'data-value': 'Website'})
         if website_tag and website_tag.get('href'):
             data['Website'] = website_tag['href']
@@ -143,6 +122,7 @@ def scrape_google_maps(queries):
         url = f"https://www.google.com/maps/search/{quote_plus(query_cleaned)}"
         
         try:
+            # Each request gets a fresh, random User-Agent from this call
             response = requests.get(url, headers=get_headers(), timeout=20)
             response.raise_for_status()
             
@@ -152,8 +132,7 @@ def scrape_google_maps(queries):
             if not scraped_data:
                 status_text.warning(f"⚠️ No parseable results for '{query_cleaned}'. Query might be too broad/narrow, or the page was blocked.")
             else:
-                for item in scraped_data:
-                    item['Query'] = query_cleaned
+                for item in scraped_data: item['Query'] = query_cleaned
                 all_results.extend(scraped_data)
 
         except requests.exceptions.RequestException as e:
@@ -176,7 +155,7 @@ st.set_page_config(page_title="Google Maps Scraper", layout="wide", initial_side
 
 st.title("🛰️ Robust Google Maps Scraper")
 st.markdown("""
-This app performs a **browserless** search on Google Maps. It's built to be resilient against common HTML changes.
+This app performs a **browserless** search on Google Maps. It's built to be resilient against common HTML changes and uses randomized headers for each request.
 
 **Instructions:**
 1.  Enter search queries in the box below (one per line).
