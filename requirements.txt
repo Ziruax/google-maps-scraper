@@ -1,7 +1,7 @@
-streamlit
-selenium
-webdriver-manager
-fake-useragent
-requests
-beautifulsoup4
-pandas
+streamlit==1.30.0
+beautifulsoup4==4.12.3
+requests==2.31.0
+fake-useragent==1.4.0
+pandas==2.1.4
+lxml==5.1.0
+urllib3==2.2.1
