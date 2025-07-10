@@ -5,33 +5,46 @@ import time
 import re
 import os
 import random
-import concurrent.futures
-import queue
-import threading
+import json
+import logging
 from datetime import datetime
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Configuration
 USER_AGENT_ROTATION = True
-TIMEOUT = 25
-MAX_WORKERS = 4
+TIMEOUT = 30
 MAX_RETRIES = 5
-REQUEST_DELAY = 2.0
+REQUEST_DELAY = 3.0
 CAPTCHA_BYPASS_ATTEMPTS = 3
 
-# Updated selectors for current Google Maps layout
+# Updated selectors with multiple fallbacks
 SELECTORS = {
-    'business_card': 'div[role="article"]',
-    'business_name': 'div.fontHeadlineLarge',
-    'business_address': 'div > div > div.fontBodyMedium > div:nth-child(4)',
-    'business_phone': 'div > div > div.fontBodyMedium > div:nth-child(5)',
-    'business_website': 'a[href*="/url?"]',
-    'business_rating': 'span[aria-label*="stars"]',
-    'business_reviews': 'span[aria-label*="reviews"]',
-    'business_category': 'div > div > div.fontBodyMedium > div:nth-child(2)',
-    'next_page_button': 'button[aria-label="Next page"]',
-    'result_count': 'div.fontBodyMedium > div > div > div:nth-child(2)'
+    'business_card': ['div[role="article"]', 'div.Nv2PK', 'div.section-result'],
+    'business_name': ['div.fontHeadlineLarge', 'div.qBF1Pd', 'h2.section-result-title'],
+    'business_address': [
+        'div > div > div.fontBodyMedium > div:nth-child(4)',
+        'div.W4Efsd > span:nth-child(2)',
+        'span.section-result-location'
+    ],
+    'business_phone': [
+        'div > div > div.fontBodyMedium > div:nth-child(5)',
+        'span[aria-label*="Phone"]',
+        'span.section-result-phone'
+    ],
+    'business_website': [
+        'a[href*="/url?"]',
+        'a[aria-label*="Website"]',
+        'a.section-result-action-icon'
+    ],
+    'business_rating': ['span[aria-label*="stars"]', 'div.section-result-rating'],
+    'business_reviews': ['span[aria-label*="reviews"]', 'span.section-result-num-ratings'],
+    'business_category': ['div > div > div.fontBodyMedium > div:nth-child(2)', 'div.section-result-details-container'],
+    'result_count': ['div.fontBodyMedium > div > div > div:nth-child(2)', 'div.section-result-header']
 }
 
 # Common user agents
@@ -88,40 +101,62 @@ def extract_emails_from_website(url):
     except:
         return []
 
+def find_element_with_fallback(soup, selectors):
+    """Try multiple selectors until one works"""
+    for selector in selectors:
+        element = soup.select_one(selector)
+        if element:
+            return element
+    return None
+
 def extract_business_data(soup):
-    """Extract business data from Google Maps HTML"""
+    """Extract business data from Google Maps HTML with fallbacks"""
     results = []
-    business_cards = soup.select(SELECTORS['business_card'])
+    
+    # Try all possible card selectors
+    for card_selector in SELECTORS['business_card']:
+        business_cards = soup.select(card_selector)
+        if business_cards:
+            break
+    
+    if not business_cards:
+        logger.warning("No business cards found with any selector")
+        return results
+    
+    logger.info(f"Found {len(business_cards)} business cards")
     
     for card in business_cards:
         try:
             # Business Name
-            name_elem = card.select_one(SELECTORS['business_name'])
+            name_elem = find_element_with_fallback(card, SELECTORS['business_name'])
             name = clean_text(name_elem.text) if name_elem else "N/A"
             
             # Address
-            address_elem = card.select_one(SELECTORS['business_address'])
+            address_elem = find_element_with_fallback(card, SELECTORS['business_address'])
             address = clean_text(address_elem.text) if address_elem else "N/A"
             
             # Phone
-            phone_elem = card.select_one(SELECTORS['business_phone'])
+            phone_elem = find_element_with_fallback(card, SELECTORS['business_phone'])
             phone = clean_text(phone_elem.text) if phone_elem else "N/A"
             
             # Website
-            website_elem = card.select_one(SELECTORS['business_website'])
+            website_elem = find_element_with_fallback(card, SELECTORS['business_website'])
             website = website_elem['href'] if website_elem else "don't have website"
             website = resolve_google_redirect(website)
             
             # Rating
-            rating_elem = card.select_one(SELECTORS['business_rating'])
-            rating = clean_text(rating_elem['aria-label'].split()[0]) if rating_elem else "N/A"
+            rating_elem = find_element_with_fallback(card, SELECTORS['business_rating'])
+            if rating_elem and 'aria-label' in rating_elem.attrs:
+                rating = clean_text(rating_elem['aria-label'].split()[0])
+            else:
+                rating = clean_text(rating_elem.text) if rating_elem else "N/A"
             
             # Reviews
-            reviews_elem = card.select_one(SELECTORS['business_reviews'])
-            reviews = clean_text(reviews_elem['aria-label']) if reviews_elem else "N/A"
+            reviews_elem = find_element_with_fallback(card, SELECTORS['business_reviews'])
+            reviews = clean_text(reviews_elem.text) if reviews_elem else "N/A"
             
             # Category
-            category_elem = card.select_one(SELECTORS['business_category'])
+            category_elem = find_element_with_fallback(card, SELECTORS['business_category'])
             category = clean_text(category_elem.text) if category_elem else "N/A"
             
             results.append({
@@ -134,6 +169,7 @@ def extract_business_data(soup):
                 'Category': category
             })
         except Exception as e:
+            logger.error(f"Error processing card: {str(e)}")
             continue
             
     return results
@@ -141,7 +177,7 @@ def extract_business_data(soup):
 def get_result_count(soup):
     """Get total result count from page"""
     try:
-        count_elem = soup.select_one(SELECTORS['result_count'])
+        count_elem = find_element_with_fallback(soup, SELECTORS['result_count'])
         if count_elem:
             count_text = clean_text(count_elem.text)
             match = re.search(r'(\d+(,\d+)*)', count_text.replace(',', ''))
@@ -151,21 +187,22 @@ def get_result_count(soup):
     except:
         return 0
 
-def handle_captcha(soup, query):
+def handle_captcha(response, query):
     """Detect and handle CAPTCHA challenges"""
-    if "captcha" in soup.text.lower() or "denied" in soup.text.lower():
-        st.warning(f"CAPTCHA detected for: {query}")
+    if "captcha" in response.text.lower() or "denied" in response.text.lower():
+        logger.warning(f"CAPTCHA detected for: {query}")
         return True
     return False
 
-def scrape_google_maps(query, progress_callback=None):
-    """Scrape Google Maps for business listings with infinite scrolling"""
+def scrape_google_maps(query):
+    """Scrape Google Maps for business listings with multiple fallbacks"""
     base_url = "https://www.google.com/maps/search/"
     
     headers = {
         'User-Agent': get_random_user_agent(),
         'Accept-Language': 'en-US,en;q=0.5',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Referer': 'https://www.google.com/'
     }
     
     params = {'q': query}
@@ -186,18 +223,18 @@ def scrape_google_maps(query, progress_callback=None):
                     timeout=TIMEOUT
                 )
                 
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Check for CAPTCHA
-                if handle_captcha(soup, query):
+                if handle_captcha(response, query):
                     captcha_retries += 1
                     time.sleep(10)  # Longer delay for CAPTCHA
                     continue
                 
                 if response.status_code != 200:
+                    logger.warning(f"Request failed with status {response.status_code}, retrying...")
                     retries += 1
                     time.sleep(REQUEST_DELAY * 2)
                     continue
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
                 
                 # Get initial results
                 page_results = extract_business_data(soup)
@@ -206,17 +243,20 @@ def scrape_google_maps(query, progress_callback=None):
                 # Get total result count
                 result_count = get_result_count(soup)
                 
+                logger.info(f"Initial results: {len(page_results)} | Total results: {result_count}")
+                
                 # Reset retries after successful request
                 retries = 0
                 break
                     
-            except requests.exceptions.RequestException:
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request exception: {str(e)}")
                 retries += 1
                 time.sleep(REQUEST_DELAY * 3)
         
         # If we have a result count, scrape all pages
         if result_count > 0:
-            st.info(f"Found {result_count} total results for: {query}")
+            logger.info(f"Found {result_count} total results for: {query}")
             
             # Continuously scrape until we have all results
             while len(all_results) < result_count and retries < MAX_RETRIES:
@@ -231,10 +271,7 @@ def scrape_google_maps(query, progress_callback=None):
                         timeout=TIMEOUT
                     )
                     
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    
-                    # Check for CAPTCHA
-                    if handle_captcha(soup, query):
+                    if handle_captcha(response, query):
                         captcha_retries += 1
                         time.sleep(15)
                         continue
@@ -244,16 +281,16 @@ def scrape_google_maps(query, progress_callback=None):
                         time.sleep(REQUEST_DELAY * 2)
                         continue
                     
+                    soup = BeautifulSoup(response.text, 'html.parser')
                     page_results = extract_business_data(soup)
                     
                     if not page_results:
+                        logger.info("No more results found")
                         break
                     
                     all_results.extend(page_results)
                     
-                    # Update progress
-                    if progress_callback:
-                        progress_callback(len(all_results))
+                    logger.info(f"Page results: {len(page_results)} | Total collected: {len(all_results)}")
                     
                     # Respectful delay
                     time.sleep(REQUEST_DELAY)
@@ -261,30 +298,16 @@ def scrape_google_maps(query, progress_callback=None):
                     # Reset retries after successful request
                     retries = 0
                     
-                except requests.exceptions.RequestException:
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Request exception: {str(e)}")
                     retries += 1
                     time.sleep(REQUEST_DELAY * 3)
         
         return all_results
         
     except Exception as e:
-        st.error(f"Scraping failed for '{query}': {str(e)}")
+        logger.error(f"Scraping failed for '{query}': {str(e)}")
         return []
-
-def scrape_worker(query_queue, result_queue, progress_dict):
-    """Worker thread for concurrent scraping"""
-    while not query_queue.empty():
-        try:
-            query = query_queue.get_nowait()
-            results = scrape_google_maps(
-                query, 
-                progress_callback=lambda count: progress_dict.update({query: count})
-            )
-            result_queue.put((query, results))
-        except queue.Empty:
-            break
-        finally:
-            query_queue.task_done()
 
 def export_to_csv(data, filename_prefix):
     """Export data to CSV with timestamp"""
@@ -307,7 +330,7 @@ def export_to_csv(data, filename_prefix):
 
 def main():
     st.set_page_config(
-        page_title="Unlimited Google Maps Scraper",
+        page_title="Robust Google Maps Scraper",
         page_icon="🌐",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -342,30 +365,26 @@ def main():
             border-radius: 8px;
             border: 1px solid #e0e0e0;
         }
-        .lead-badge {
-            background-color: #34a853;
-            color: white;
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 0.8rem;
-            font-weight: bold;
-            display: inline-block;
-            margin-left: 8px;
-        }
         .scraping-info {
             background-color: #e8f0fe;
             padding: 15px;
             border-radius: 10px;
             margin-bottom: 20px;
         }
+        .debug-section {
+            background-color: #fff8e1;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+        }
     </style>
     """, unsafe_allow_html=True)
     
-    st.title("🌐 Unlimited Google Maps Scraper")
+    st.title("🌐 Robust Google Maps Scraper")
     st.markdown("""
     <div class="scraping-info">
-        <h3 style="color: #1a73e8; margin-top: 0;">Scrape All Business Listings Without Limits</h3>
-        <p>Get every result from Google Maps searches with complete contact information</p>
+        <h3 style="color: #1a73e8; margin-top: 0;">Advanced Scraping with Multiple Fallback Methods</h3>
+        <p>This version uses multiple selector strategies to overcome Google's anti-scraping measures</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -376,12 +395,13 @@ def main():
             "**Enter search queries (one per line):**",
             height=200,
             placeholder="Restaurants in New York\nCoffee shops in London\nDentists in Chicago...",
-            help="Enter multiple search terms for bulk scraping"
+            help="Enter multiple search terms for bulk scraping",
+            value="Real estate agents Texas"
         ).splitlines()
     
     with col2:
         st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-        st.markdown("**Power Search Examples:**")
+        st.markdown("**Effective Query Examples:**")
         st.markdown("- `Marketing agencies near me`")
         st.markdown("- `Gym owners in Miami`")
         st.markdown("- `Real estate agents Texas`")
@@ -392,23 +412,22 @@ def main():
         st.markdown("## ⚙️ Configuration")
         request_delay = st.slider("Request Delay (seconds)", 1, 10, 3, 
                                  help="Longer delays prevent blocking")
-        enable_concurrent = st.checkbox("Enable parallel scraping", value=True,
-                                      help="Faster results for multiple queries")
         enable_email = st.checkbox("Extract emails from websites", value=True,
                                  help="Find contact emails (slower but valuable)")
         
         st.markdown("## 🛡 Anti-Blocking Features")
+        st.markdown("- Multiple selector fallbacks")
         st.markdown("- Rotating User Agents")
-        st.markdown("- Randomized request timing")
         st.markdown("- CAPTCHA detection")
-        st.markdown("- Automatic retries")
+        st.markdown("- Request throttling")
+        st.markdown("- Session persistence")
         
-        st.markdown("## 📦 Deployment Verified")
-        st.success("Compatible with Streamlit Cloud")
-        st.info("No external dependencies required")
+        st.markdown("## 🐞 Debugging Tools")
+        debug_mode = st.checkbox("Enable debug mode", value=False,
+                               help="Show detailed scraping information")
 
     # Process button
-    if st.button("🚀 Start Unlimited Scraping", use_container_width=True, type="primary"):
+    if st.button("🚀 Start Advanced Scraping", use_container_width=True, type="primary"):
         if not queries or not any(q.strip() for q in queries):
             st.error("Please enter at least one search query")
             st.stop()
@@ -420,79 +439,49 @@ def main():
             st.session_state.scraping_complete = False
             
         all_data = st.session_state.all_data
-        progress_text = st.empty()
-        progress_bar = st.progress(0)
         status_area = st.empty()
         results_container = st.container()
-        progress_dict = {}
+        debug_container = st.container()
         
         start_time = time.time()
         valid_queries = [q.strip() for q in queries if q.strip()]
-        query_count = len(valid_queries)
         
         # Display scraping info
-        status_area.info("🔥 Starting unlimited scraping... This may take time for large result sets")
+        status_area.info("🔍 Starting advanced scraping with multiple fallback methods...")
         
-        if enable_concurrent and query_count > 1:
-            # Concurrent scraping with thread pool
-            query_queue = queue.Queue()
-            result_queue = queue.Queue()
+        # Sequential scraping with detailed logging
+        for i, query in enumerate(valid_queries):
+            status_area.info(f"🌐 Processing: {query}...")
             
-            for query in valid_queries:
-                query_queue.put(query)
-                progress_dict[query] = 0
+            # Create a progress bar for each query
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, query_count)) as executor:
-                for _ in range(min(MAX_WORKERS, query_count)):
-                    executor.submit(
-                        scrape_worker, 
-                        query_queue, 
-                        result_queue, 
-                        progress_dict
-                    )
-                
-                processed = 0
-                while processed < query_count:
-                    try:
-                        query, results = result_queue.get(timeout=120)
-                        all_data.extend(results)
-                        processed += 1
-                        progress_bar.progress(processed / query_count)
-                        
-                        # Update status
-                        status_area.success(f"✅ {query}: Collected {len(results)} businesses")
-                        
-                        # Show intermediate results
-                        if results:
-                            with results_container:
-                                st.info(f"**Latest results from {query}:**")
-                                st.json(results[-1], expanded=False)
-                    except queue.Empty:
-                        time.sleep(1)
-            
-        else:
-            # Sequential scraping
-            for i, query in enumerate(valid_queries):
-                status_area.info(f"🔍 Searching: {query}...")
-                results = scrape_google_maps(
-                    query, 
-                    progress_callback=lambda count: progress_dict.update({query: count})
-                )
-                
-                if results:
-                    all_data.extend(results)
-                    status_area.success(f"✅ Found {len(results)} businesses for: {query}")
-                    
-                    # Show intermediate results
+            # Scrape with retries
+            results = []
+            for attempt in range(MAX_RETRIES):
+                try:
+                    status_text.info(f"Attempt {attempt+1}/{MAX_RETRIES} for: {query}")
+                    results = scrape_google_maps(query)
                     if results:
-                        with results_container:
-                            st.info(f"**Latest results from {query}:**")
-                            st.json(results[-1], expanded=False)
-                else:
-                    status_area.warning(f"⚠️ No results found for: {query}")
+                        break
+                except Exception as e:
+                    status_text.error(f"Error during attempt {attempt+1}: {str(e)}")
+                    time.sleep(REQUEST_DELAY * 2)
+            
+            if results:
+                all_data.extend(results)
+                status_area.success(f"✅ Found {len(results)} results for: {query}")
                 
-                progress_bar.progress((i + 1) / query_count)
-                time.sleep(1)
+                # Show intermediate results
+                with results_container:
+                    st.info(f"**Results from {query}:**")
+                    st.json(results[0] if results else {}, expanded=False)
+            else:
+                status_area.warning(f"⚠️ No results found for: {query}")
+            
+            progress_bar.progress(100)
+            time.sleep(1)
         
         # Update session state
         st.session_state.all_data = all_data
@@ -503,14 +492,20 @@ def main():
             with st.spinner("🔍 Extracting email addresses from websites..."):
                 email_bar = st.progress(0)
                 total_businesses = len(all_data)
+                extracted_count = 0
                 
                 for i, business in enumerate(all_data):
                     if business['Website'] and business['Website'] != "don't have website":
-                        business['Emails'] = ", ".join(extract_emails_from_website(business['Website']))
+                        emails = extract_emails_from_website(business['Website'])
+                        if emails:
+                            business['Emails'] = ", ".join(emails)
+                            extracted_count += 1
+                        else:
+                            business['Emails'] = "N/A"
                     else:
                         business['Emails'] = "N/A"
                     
-                    # Update progress more frequently
+                    # Update progress
                     if i % 5 == 0 or i == total_businesses - 1:
                         email_bar.progress((i + 1) / total_businesses)
         
@@ -528,7 +523,7 @@ def main():
                     st.json(all_data[0], expanded=False)
             
             # Export options
-            csv_file = export_to_csv(all_data, "unlimited_google_maps_results")
+            csv_file = export_to_csv(all_data, "google_maps_results")
             if csv_file:
                 with open(csv_file, "rb") as f:
                     st.download_button(
@@ -544,6 +539,27 @@ def main():
                     os.remove(csv_file)
         else:
             st.error("No business data collected. Try different queries or check settings.")
+            
+        # Debug info
+        if debug_mode:
+            with debug_container:
+                st.markdown("## 🐞 Debug Information")
+                st.info("""
+                **Scraping Process Details:**
+                - Used multiple selector fallbacks for each element
+                - Rotated user agents between requests
+                - Implemented CAPTCHA detection and handling
+                - Used session persistence for better reliability
+                """)
+                
+                if valid_queries:
+                    st.write(f"**Processed Queries:** {', '.join(valid_queries)}")
+                    st.write(f"**Total Results Collected:** {len(all_data)}")
+                    st.write(f"**Time Taken:** {elapsed:.1f} seconds")
+                    
+                    if all_data:
+                        st.write("**Sample Data Structure:**")
+                        st.json(all_data[0])
 
     # Show session data if scraping completed
     if st.session_state.get('scraping_complete', False) and st.session_state.get('all_data'):
@@ -551,7 +567,7 @@ def main():
         st.info(f"Total businesses collected: {len(st.session_state.all_data)}")
         
         if st.button("🔄 Export Results Again", use_container_width=True):
-            csv_file = export_to_csv(st.session_state.all_data, "unlimited_google_maps_results")
+            csv_file = export_to_csv(st.session_state.all_data, "google_maps_results")
             if csv_file:
                 with open(csv_file, "rb") as f:
                     st.download_button(
