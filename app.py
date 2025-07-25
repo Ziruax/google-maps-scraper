@@ -1,118 +1,83 @@
 # app.py
 import streamlit as st
 import pandas as pd
+import requests
 import time
+import json
 import re
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from urllib.parse import quote_plus
 from fake_useragent import UserAgent
-import tempfile
-import os
 
-# Setup Chrome options for headless browsing
-@st.cache_resource
-def setup_driver():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
-    ua = UserAgent()
-    chrome_options.add_argument(f'--user-agent={ua.random}')
-    return webdriver.Chrome(options=chrome_options)
+# Initialize fake user agent
+ua = UserAgent()
 
-def scroll_to_bottom(driver, pause_time=2):
-    """Scroll to the bottom of the page to load all results"""
-    last_height = driver.execute_script("return document.body.scrollHeight")
+def get_initial_data(keyword):
+    """Get initial search results from Google Maps"""
+    query = quote_plus(keyword)
+    url = f"https://www.google.com/maps/search/{query}"
     
-    while True:
-        # Scroll down to bottom
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        
-        # Wait to load page
-        time.sleep(pause_time)
-        
-        # Calculate new scroll height and compare to last height
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
-
-def extract_business_info(driver, keyword):
-    """Extract business information from search results"""
-    businesses = []
+    headers = {
+        'User-Agent': ua.random,
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.google.com/',
+        'Connection': 'keep-alive',
+    }
     
     try:
-        # Wait for results to load
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "bfdHYd"))
-        )
-    except:
-        st.warning(f"No results found for: {keyword}")
-        return businesses
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        # Extract initial data from response
+        match = re.search(r'window\.APP_INITIALIZATION_STATE=(.*?);window\.APP_FLAGS', response.text)
+        if match:
+            data = json.loads(match.group(1))
+            return data
+    except Exception as e:
+        st.error(f"Error fetching initial data for {keyword}: {str(e)}")
+        return None
+
+def extract_businesses_from_html(html_content, keyword):
+    """Extract business information from HTML content"""
+    from bs4 import BeautifulSoup
     
-    # Scroll to load all results
-    scroll_to_bottom(driver)
+    soup = BeautifulSoup(html_content, 'html.parser')
+    businesses = []
     
     # Find all business listings
-    listings = driver.find_elements(By.CLASS_NAME, "bfdHYd")
+    listings = soup.find_all('div', {'class': 'bfdHYd'})
     
     for listing in listings:
         try:
             # Business Name
-            try:
-                name_elem = listing.find_element(By.CLASS_NAME, "qBF1Pd")
-                name = name_elem.text.strip()
-            except:
-                name = "N/A"
+            name_elem = listing.find('div', {'class': 'qBF1Pd'})
+            name = name_elem.text.strip() if name_elem else "N/A"
             
             # Rating
-            try:
-                rating_elem = listing.find_element(By.CLASS_NAME, "MW4etd")
-                rating = rating_elem.text.strip()
-            except:
-                rating = "N/A"
+            rating_elem = listing.find('span', {'class': 'MW4etd'})
+            rating = rating_elem.text.strip() if rating_elem else "N/A"
             
             # Reviews Count
-            try:
-                reviews_elem = listing.find_element(By.CLASS_NAME, "UY7F9")
-                reviews = reviews_elem.text.strip().replace("(", "").replace(")", "")
-            except:
-                reviews = "N/A"
+            reviews_elem = listing.find('span', {'class': 'UY7F9'})
+            reviews = reviews_elem.text.strip().replace('(', '').replace(')', '') if reviews_elem else "N/A"
             
-            # Address and Category
-            try:
-                address_elem = listing.find_element(By.CLASS_NAME, "W4Efsd")
-                address_info = address_elem.text.strip()
-            except:
-                address_info = "N/A"
+            # Address/Category
+            address_elem = listing.find('div', {'class': 'W4Efsd'})
+            address = address_elem.text.strip() if address_elem else "N/A"
             
             # Phone Number
-            try:
-                phone_elem = listing.find_element(By.CLASS_NAME, "UsdlK")
-                phone = phone_elem.text.strip()
-            except:
-                phone = "N/A"
+            phone_elem = listing.find('span', {'class': 'UsdlK'})
+            phone = phone_elem.text.strip() if phone_elem else "N/A"
             
             # Website
-            try:
-                website_elem = listing.find_element(By.CLASS_NAME, "lcr4fd")
-                website = website_elem.get_attribute("href")
-            except:
-                website = "N/A"
+            website_elem = listing.find('a', {'class': 'lcr4fd'})
+            website = website_elem.get('href') if website_elem else "N/A"
             
             # Profile Link
-            try:
-                profile_elem = listing.find_element(By.CLASS_NAME, "hfpxzc")
-                profile_link = profile_elem.get_attribute("href")
-            except:
-                profile_link = "N/A"
+            profile_elem = listing.find('a', {'class': 'hfpxzc'})
+            profile_link = profile_elem.get('href') if profile_elem else "N/A"
             
-            # Email (usually not available in search results)
+            # Email (not typically available in search results)
             email = "N/A"
             
             businesses.append({
@@ -123,30 +88,92 @@ def extract_business_info(driver, keyword):
                 "GMB Profile Link": profile_link,
                 "Rating": rating,
                 "Total Reviews": reviews,
-                "Address": address_info,
+                "Address": address,
                 "Keyword": keyword
             })
             
         except Exception as e:
-            st.warning(f"Error extracting business info: {str(e)}")
+            st.warning(f"Error parsing listing: {str(e)}")
             continue
     
     return businesses
 
-def scrape_keyword(driver, keyword):
-    """Scrape businesses for a single keyword"""
-    search_url = f"https://www.google.com/maps/search/{keyword.replace(' ', '+')}"
+def scrape_with_pagination(keyword, max_pages=5):
+    """Scrape Google Maps with pagination simulation"""
+    businesses = []
+    session = requests.Session()
+    
+    headers = {
+        'User-Agent': ua.random,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+    }
+    
+    session.headers.update(headers)
+    
+    query = quote_plus(keyword)
+    base_url = f"https://www.google.com/maps/search/{query}"
     
     try:
-        driver.get(search_url)
-        time.sleep(3)  # Allow page to load
+        response = session.get(base_url, timeout=15)
+        response.raise_for_status()
         
-        businesses = extract_business_info(driver, keyword)
-        return businesses
-    
-    except Exception as e:
+        # Extract businesses from initial page
+        page_businesses = extract_businesses_from_html(response.text, keyword)
+        businesses.extend(page_businesses)
+        
+        # Try to get more results by simulating scroll/pagination
+        # This is a simplified approach - in reality, Google Maps uses complex JS
+        for page in range(1, max_pages):
+            # Add delay to simulate human behavior
+            time.sleep(2)
+            
+            # Try to get next page (this is a simplified approach)
+            next_url = f"{base_url}?page={page+1}"
+            try:
+                next_response = session.get(next_url, timeout=15)
+                next_response.raise_for_status()
+                
+                next_businesses = extract_businesses_from_html(next_response.text, keyword)
+                if not next_businesses:
+                    break  # No more results
+                
+                businesses.extend(next_businesses)
+            except:
+                break  # Stop if we can't get more pages
+                
+    except requests.RequestException as e:
         st.error(f"Error scraping {keyword}: {str(e)}")
-        return []
+    
+    return businesses
+
+def scrape_google_maps_api_approach(keyword):
+    """Alternative approach using Google's internal APIs"""
+    businesses = []
+    
+    # This is a simplified simulation - actual implementation would need
+    # to reverse-engineer Google's internal API calls
+    
+    query = quote_plus(keyword)
+    search_url = f"https://www.google.com/maps/search/{query}"
+    
+    headers = {
+        'User-Agent': ua.random,
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.google.com/',
+        'X-Requested-With': 'XMLHttpRequest',
+    }
+    
+    try:
+        response = requests.get(search_url, headers=headers, timeout=15)
+        businesses = extract_businesses_from_html(response.text, keyword)
+    except Exception as e:
+        st.error(f"Error with API approach for {keyword}: {str(e)}")
+    
+    return businesses
 
 def main():
     st.set_page_config(page_title="Google Maps Bulk Scraper", layout="wide")
@@ -163,7 +190,7 @@ def main():
         4. Download CSV file
         """)
         st.markdown("---")
-        st.markdown("**Note:** This tool may take several minutes for large keyword lists.")
+        st.markdown("**Note:** Results depend on Google's current HTML structure")
     
     # Input area
     keywords_input = st.text_area(
@@ -177,7 +204,7 @@ def main():
     with col1:
         delay = st.slider("Delay between requests (seconds)", 1, 10, 3)
     with col2:
-        scroll_pause = st.slider("Scroll pause time (seconds)", 1, 5, 2)
+        max_pages = st.slider("Max pages per keyword", 1, 10, 3)
     
     # Start scraping button
     if st.button("🚀 Start Scraping", use_container_width=True):
@@ -190,62 +217,50 @@ def main():
             st.warning("Please enter valid keywords")
             return
         
-        # Initialize driver
-        with st.spinner("Initializing browser..."):
-            try:
-                driver = setup_driver()
-            except Exception as e:
-                st.error(f"Failed to initialize browser: {str(e)}")
-                return
-        
         all_results = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        try:
-            for i, keyword in enumerate(keywords):
-                status_text.info(f"Scraping: {keyword} ({i+1}/{len(keywords)})")
-                
-                # Scrape keyword
-                results = scrape_keyword(driver, keyword)
-                all_results.extend(results)
-                
-                progress_bar.progress((i + 1) / len(keywords))
-                
-                # Delay between requests
-                if i < len(keywords) - 1:  # No delay after last keyword
-                    time.sleep(delay)
+        for i, keyword in enumerate(keywords):
+            status_text.info(f"Scraping: {keyword} ({i+1}/{len(keywords)})")
             
-            # Close driver
-            driver.quit()
+            # Try different approaches
+            results = scrape_with_pagination(keyword, max_pages)
             
-            # Convert to DataFrame
-            if all_results:
-                df = pd.DataFrame(all_results)
-                
-                # Display results
-                st.success(f"✅ Scraping completed! Found {len(df)} businesses")
-                st.dataframe(df, use_container_width=True)
-                
-                # Download button
-                csv = df.to_csv(index=False)
-                st.download_button(
-                    label="💾 Download CSV",
-                    data=csv,
-                    file_name="google_maps_businesses.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-            else:
-                st.warning("No businesses found for the given keywords")
-                
-        except Exception as e:
-            st.error(f"An error occurred during scraping: {str(e)}")
-            try:
-                driver.quit()
-            except:
-                pass
+            # If first approach fails, try alternative
+            if not results:
+                results = scrape_google_maps_api_approach(keyword)
+            
+            all_results.extend(results)
+            progress_bar.progress((i + 1) / len(keywords))
+            
+            # Delay between requests
+            if i < len(keywords) - 1:
+                time.sleep(delay)
+        
+        # Convert to DataFrame
+        if all_results:
+            df = pd.DataFrame(all_results)
+            
+            # Remove duplicates based on business name and address
+            df = df.drop_duplicates(subset=['Business Name', 'Address'])
+            
+            # Display results
+            st.success(f"✅ Scraping completed! Found {len(df)} unique businesses")
+            st.dataframe(df, use_container_width=True)
+            
+            # Download button
+            csv = df.to_csv(index=False)
+            st.download_button(
+                label="💾 Download CSV",
+                data=csv,
+                file_name="google_maps_businesses.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        else:
+            st.warning("No businesses found. Try different keywords or check your connection.")
 
 if __name__ == "__main__":
     main()
