@@ -1,8 +1,7 @@
 # requirements.txt
-
-streamlit
-pandas
-requests
-beautifulsoup4
-fake_useragent
-lxml
+streamlit==1.28.0
+pandas==1.5.3
+requests==2.31.0
+beautifulsoup4==4.12.2
+fake-useragent==1.4.0
+lxml==4.9.3
